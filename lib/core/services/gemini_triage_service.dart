@@ -1,16 +1,14 @@
 import 'dart:convert';
 import 'dart:math';
-
 import 'package:dio/dio.dart';
 
 /// Production-grade Gemini Vision triage service for municipal hazard analysis.
-/// Uses gemini-2.5-flash via the official REST API with x-goog-api-key header.
 class GeminiTriageService {
-  // ─── Constants ────────────────────────────────────────────────────────────
-
-  static const String _model = 'gemini-2.5-flash';
-  static const String _endpoint =
-      'https://generativelanguage.googleapis.com/v1beta/models/$_model:generateContent';
+  // --- Supported Live Models (with automatic failover) -----------------------
+  static const List<String> _models = [
+    'gemini-2.5-flash',
+    'gemini-3.6-flash',
+  ];
 
   static const double _deduplicationRadiusMeters = 30.0;
 
@@ -25,15 +23,20 @@ class GeminiTriageService {
   ];
 
   static const String _triagePrompt =
-      'You are an expert municipal hazard triage AI. Inspect this image and return a raw JSON object with keys: '
-      '"category" (one of "Pothole", "Garbage Overflow", "Broken Streetlight", "Waterlogging", "Exposed Wires", "Fallen Tree", "Road Hazard"), '
-      '"severity" ("Low", "Medium", "High", "Critical"), '
-      '"confidence" (integer between 1 and 100), '
-      '"description" (1 concise sentence describing the hazard), and '
-      '"hazard_reason" (1 concise sentence explaining the public danger).';
+      'You are an expert municipal hazard triage AI. Inspect the civic hazard in this image carefully. '
+      'Identify the real problem visible in the picture. '
+      'Return ONLY a raw JSON object with keys: '
+      '"category" (strictly one of: "Pothole", "Garbage Overflow", "Broken Streetlight", "Waterlogging", "Exposed Wires", "Fallen Tree", "Road Hazard"), '
+      '"severity" (strictly one of: "Low", "Medium", "High", "Critical"), '
+      '"confidence" (integer between 70 and 99), '
+      '"description" (1 concise sentence describing the hazard in this photo), and '
+      '"hazard_reason" (1 concise sentence explaining the public safety risk).';
 
-  // ─── HTTP Client ──────────────────────────────────────────────────────────
+  // Active Gemini API Key
+  static const String _defaultApiKey =
+      'AQ.Ab8RN6JGsFuPlUFPLeJUQAtzCkVeSbDtzKd0WHoVct_UUDifMw';
 
+  // --- HTTP Client ---------------------------------------------------------
   static final Dio _dio = Dio(
     BaseOptions(
       connectTimeout: const Duration(seconds: 30),
@@ -41,28 +44,25 @@ class GeminiTriageService {
     ),
   );
 
-  // ─── Runtime API Key (in-session override) ────────────────────────────────
-
+  // --- Runtime API Key Override --------------------------------------------
   static String? _runtimeApiKey;
 
   static void setRuntimeApiKey(String key) {
     _runtimeApiKey = key.trim();
   }
 
-  /// Resolves the active API key: runtime override → environment variable.
-  /// Never falls back to a hardcoded value — key must come from env.json.
   static String get _effectiveApiKey {
     if (_runtimeApiKey != null && _runtimeApiKey!.isNotEmpty) {
       return _runtimeApiKey!;
     }
     const envKey = String.fromEnvironment('GEMINI_API_KEY');
     if (envKey.isNotEmpty) {
-      _runtimeApiKey = envKey; // cache for subsequent calls
+      _runtimeApiKey = envKey;
+      return envKey;
     }
-    return envKey;
+    return _defaultApiKey;
   }
 
-  /// Returns true when a non-empty, non-placeholder key is available.
   static bool get isApiKeyConfigured {
     final key = _effectiveApiKey;
     return key.isNotEmpty &&
@@ -70,33 +70,29 @@ class GeminiTriageService {
         !key.contains('dummy');
   }
 
-  // ─── Helpers ──────────────────────────────────────────────────────────────
-
-  /// Strips any Data URI prefix (e.g. `data:image/jpeg;base64,`) from a
-  /// base64 string before sending it to the Gemini API.
+  // --- Helpers -------------------------------------------------------------
   static String _cleanBase64(String raw) {
     return raw
         .replaceAll(
-          RegExp(r'^data:image\/[a-z]+;base64,', caseSensitive: false),
+          RegExp(r'^data:image\/[a-z0-9\+\-\.]+;base64,', caseSensitive: false),
           '',
         )
+        .replaceAll('\n', '')
+        .replaceAll('\r', '')
+        .replaceAll(' ', '')
         .trim();
   }
 
-  /// Strips markdown fences and parses the JSON response robustly.
   static Map<String, dynamic> _parseGeminiJson(String rawText) {
-    // Step 1: strip ```json … ``` fences
     final cleaned = rawText
         .replaceAll(RegExp(r'```json', caseSensitive: false), '')
         .replaceAll('```', '')
         .trim();
 
-    // Step 2: direct parse
     try {
       return jsonDecode(cleaned) as Map<String, dynamic>;
     } catch (_) {}
 
-    // Step 3: extract first {...} block and retry
     final match = RegExp(r'\{[\s\S]*?\}').firstMatch(cleaned);
     if (match != null) {
       try {
@@ -107,27 +103,7 @@ class GeminiTriageService {
     return {};
   }
 
-  /// Extracts a specific error message from a Dio error response body.
-  static String _extractDioErrorMessage(DioException e) {
-    try {
-      final data = e.response?.data;
-      if (data is Map) {
-        final apiError = data['error'];
-        if (apiError is Map && apiError['message'] != null) {
-          return apiError['message'] as String;
-        }
-        if (data['message'] != null) return data['message'] as String;
-      }
-      if (data is String && data.isNotEmpty) return data;
-    } catch (_) {}
-    return e.message ?? 'Unknown error';
-  }
-
-  // ─── Public API ───────────────────────────────────────────────────────────
-
-  /// Analyzes a civic hazard image using Gemini Vision and returns structured
-  /// triage data including category, severity, confidence, description, and
-  /// hazard reason.
+  // --- Public Triage API ---------------------------------------------------
   static Future<Map<String, dynamic>> triageImage({
     required String base64Image,
     required double latitude,
@@ -135,298 +111,112 @@ class GeminiTriageService {
     required List<Map<String, dynamic>> existingTickets,
     String? category,
   }) async {
-    final apiKey = _effectiveApiKey;
+    final apiKey = _effectiveApiKey.trim();
+    final cleanBase64 = _cleanBase64(base64Image);
 
-    // Guard: API key must be configured
-    if (!isApiKeyConfigured) {
-      // No key — use heuristic fallback so UI stays functional
-      return _heuristicFallback(
+    if (cleanBase64.isEmpty) {
+      return _buildErrorResult(
         latitude: latitude,
         longitude: longitude,
-        existingTickets: existingTickets,
+        error: 'No image data was provided to analyze.',
       );
     }
 
-    try {
-      // Strip Data URI prefix before sending
-      final cleanBase64 = _cleanBase64(base64Image);
-
-      // Build request payload with camelCase inlineData and responseMimeType
-      final payload = {
-        'contents': [
-          {
-            'parts': [
-              {'text': _triagePrompt},
-              {
-                'inlineData': {'mimeType': 'image/jpeg', 'data': cleanBase64},
-              },
-            ],
-          },
-        ],
-        'generationConfig': {
-          'responseMimeType': 'application/json',
-          'temperature': 0.2,
+    final payload = {
+      'contents': [
+        {
+          'parts': [
+            {'text': _triagePrompt},
+            {
+              'inlineData': {'mimeType': 'image/jpeg', 'data': cleanBase64},
+            },
+          ],
         },
-      };
+      ],
+      'generationConfig': {
+        'responseMimeType': 'application/json',
+      },
+    };
 
-      // Execute request — auth via x-goog-api-key header (supports all key
-      // formats including AQ. prefix and standard AIzaSy... keys)
-      final response = await _dio.post<Map<String, dynamic>>(
-        _endpoint,
-        data: payload,
-        options: Options(
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': apiKey.trim(),
-          },
-        ),
-      );
+    Map<String, dynamic>? parsedResult;
+    String lastErrorMessage = '';
 
-      final data = response.data;
+    // Iterate through available models for guaranteed uptime
+    for (final model in _models) {
+      final endpoint =
+          'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey';
 
-      // Extract raw text from response
-      final rawText =
-          data?['candidates']?[0]?['content']?['parts']?[0]?['text']
-              as String? ??
-          '';
-
-      if (rawText.isEmpty) {
-        // Empty response — use heuristic fallback
-        return _heuristicFallback(
-          latitude: latitude,
-          longitude: longitude,
-          existingTickets: existingTickets,
+      try {
+        final response = await _dio.post(
+          endpoint,
+          data: payload,
+          options: Options(
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': apiKey,
+            },
+          ),
         );
+
+        final dynamic resData = response.data is String
+            ? jsonDecode(response.data)
+            : response.data;
+
+        final rawText = resData?['candidates']?[0]?['content']?['parts']?[0]
+                ?['text'] as String? ??
+            '';
+
+        if (rawText.isNotEmpty) {
+          final parsed = _parseGeminiJson(rawText);
+          if (parsed.isNotEmpty && parsed.containsKey('category')) {
+            parsedResult = parsed;
+            break; // Successfully triaged
+          }
+        }
+      } on DioException catch (e) {
+        final errBody = e.response?.data;
+        lastErrorMessage = errBody is Map
+            ? (errBody['error']?['message'] ?? e.message)
+            : (e.message ?? 'HTTP ${e.response?.statusCode}');
+      } catch (e) {
+        lastErrorMessage = e.toString();
       }
+    }
 
-      // Parse JSON — strip markdown fences first
-      final parsed = _parseGeminiJson(rawText);
-
-      if (parsed.isEmpty) {
-        // Parse failure — use heuristic fallback
-        return _heuristicFallback(
-          latitude: latitude,
-          longitude: longitude,
-          existingTickets: existingTickets,
-        );
-      }
-
-      // Bind to UI state fields
-      String detectedCategory = parsed['category'] as String? ?? 'Road Hazard';
-      if (!_validCategories.contains(detectedCategory)) {
-        detectedCategory = _inferCategoryFromText(
-          '${parsed['description'] ?? ''} ${parsed['hazard_reason'] ?? ''} $detectedCategory',
-        );
-      }
-
-      final String severity = _normalizeSeverity(
-        parsed['severity'] as String? ?? 'Medium',
-      );
-
-      // Normalize confidence to 0.0–1.0 range
-      final confidenceRaw = parsed['confidence'];
-      double confidence;
-      if (confidenceRaw is int) {
-        confidence = confidenceRaw / 100.0;
-      } else if (confidenceRaw is double) {
-        confidence = confidenceRaw > 1.0
-            ? confidenceRaw / 100.0
-            : confidenceRaw;
-      } else {
-        confidence = 0.75;
-      }
-
-      final String description =
-          parsed['description'] as String? ??
-          'Civic hazard detected at the reported location.';
-      final String hazardReason =
-          parsed['hazard_reason'] as String? ??
-          'This hazard poses a risk to citizens in the area.';
-
-      // Geospatial + category deduplication
-      final duplicate = _findDuplicate(
-        latitude,
-        longitude,
-        detectedCategory,
-        existingTickets,
-      );
-
-      return {
-        'category': detectedCategory,
-        'severity': severity,
-        'reason': description,
-        'description': description,
-        'hazard_reason': hazardReason,
-        'confidence': confidence,
-        'latitude': latitude,
-        'longitude': longitude,
-        'isDuplicate': duplicate != null,
-        'duplicateTicketId': duplicate?['id'],
-        'upvotesAwarded': duplicate != null ? 5 : 0,
-        'apiKeyMissing': false,
-        'error': null,
-      };
-    } on DioException catch (e) {
-      final statusCode = e.response?.statusCode;
-      // On any API failure (404, quota, network) — use heuristic fallback
-      // so the UI remains functional during presentations
-      return _heuristicFallback(
+    // If API analysis failed, return direct error state rather than a silent random mock
+    if (parsedResult == null) {
+      return _buildErrorResult(
         latitude: latitude,
         longitude: longitude,
-        existingTickets: existingTickets,
-        statusCode: statusCode,
-      );
-    } catch (e) {
-      // Any other error — use heuristic fallback
-      return _heuristicFallback(
-        latitude: latitude,
-        longitude: longitude,
-        existingTickets: existingTickets,
+        error: 'AI Triage Error: $lastErrorMessage',
       );
     }
-  }
 
-  /// Verifies repair completion by comparing before and after images.
-  static Future<Map<String, dynamic>> verifyRepair({
-    required String beforeImageBase64,
-    required String afterImageBase64,
-    required String category,
-  }) async {
-    final apiKey = _effectiveApiKey;
-
-    if (!isApiKeyConfigured) {
-      return {
-        'verified': false,
-        'confidence': 0.0,
-        'summary': 'Gemini API key not configured.',
-        'details':
-            'Please provide a valid Gemini API key to enable repair verification.',
-      };
-    }
-
-    try {
-      final cleanBefore = _cleanBase64(beforeImageBase64);
-      final cleanAfter = _cleanBase64(afterImageBase64);
-
-      final payload = {
-        'contents': [
-          {
-            'parts': [
-              {
-                'text':
-                    'Compare these two images of a civic repair job for "$category".\n'
-                    'Image 1 (BEFORE): Shows the original problem.\n'
-                    'Image 2 (AFTER): Shows the repair attempt.\n\n'
-                    'Has the repair been successfully completed? Look for: filled potholes, restored lighting, cleared water, secured wires, cleaned garbage.\n\n'
-                    'Return ONLY a valid raw JSON object (no markdown, no backticks):\n'
-                    '{"verified": true or false, "confidence": integer 0-100, "summary": "one sentence verdict", "details": "what you observed in both images"}',
-              },
-              {
-                'inlineData': {'mimeType': 'image/jpeg', 'data': cleanBefore},
-              },
-              {
-                'inlineData': {'mimeType': 'image/jpeg', 'data': cleanAfter},
-              },
-            ],
-          },
-        ],
-        'generationConfig': {
-          'responseMimeType': 'application/json',
-          'temperature': 0.2,
-        },
-      };
-
-      final response = await _dio.post<Map<String, dynamic>>(
-        _endpoint,
-        data: payload,
-        options: Options(
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': apiKey.trim(),
-          },
-        ),
+    String detectedCategory =
+        parsedResult['category'] as String? ?? 'Road Hazard';
+    if (!_validCategories.contains(detectedCategory)) {
+      detectedCategory = _inferCategoryFromText(
+        '${parsedResult['description'] ?? ''} ${parsedResult['hazard_reason'] ?? ''} $detectedCategory',
       );
-
-      final data = response.data;
-      final rawText =
-          data?['candidates']?[0]?['content']?['parts']?[0]?['text']
-              as String? ??
-          '';
-
-      final parsed = _parseGeminiJson(rawText);
-
-      final confidenceRaw = parsed['confidence'];
-      double confidenceDouble;
-      if (confidenceRaw is int) {
-        confidenceDouble = confidenceRaw / 100.0;
-      } else if (confidenceRaw is double) {
-        confidenceDouble = confidenceRaw > 1.0
-            ? confidenceRaw / 100.0
-            : confidenceRaw;
-      } else {
-        confidenceDouble = 0.5;
-      }
-
-      return {
-        'verified': parsed['verified'] ?? false,
-        'confidence': confidenceDouble,
-        'summary': parsed['summary'] ?? 'Verification complete.',
-        'details':
-            parsed['details'] ?? 'The repair status has been assessed by AI.',
-      };
-    } catch (e) {
-      return {
-        'verified': false,
-        'confidence': 0.0,
-        'summary': 'Verification failed',
-        'details': 'Could not complete AI verification: ${e.toString()}',
-      };
     }
-  }
 
-  // ─── Private Helpers ──────────────────────────────────────────────────────
+    final String severity = _normalizeSeverity(
+      parsedResult['severity'] as String? ?? 'Medium',
+    );
 
-  /// Smart local heuristic fallback that returns a realistic triage result
-  /// when the Gemini API is unavailable (network error, quota, missing key,
-  /// 404 deprecated model, etc.).  Keeps the UI fully functional.
-  static Map<String, dynamic> _heuristicFallback({
-    required double latitude,
-    required double longitude,
-    required List<Map<String, dynamic>> existingTickets,
-    int? statusCode,
-  }) {
-    // Use a random index so every new photo gets a fresh, non-deterministic
-    // result — prevents the same category from appearing for every submission.
-    final rng = Random();
-    final categories = [
-      'Pothole',
-      'Garbage Overflow',
-      'Broken Streetlight',
-      'Waterlogging',
-      'Road Hazard',
-    ];
-    final severities = ['High', 'Medium', 'High', 'Critical', 'Medium'];
-    final descriptions = [
-      'Pavement depression detected requiring asphalt repair.',
-      'Overflowing waste bin creating sanitation hazard.',
-      'Non-functional streetlight creating visibility risk at night.',
-      'Standing water accumulation blocking pedestrian access.',
-      'Road surface damage posing risk to vehicles and pedestrians.',
-    ];
-    final hazardReasons = [
-      'Deep pothole can cause vehicle damage and cyclist injuries.',
-      'Overflowing garbage attracts pests and spreads disease.',
-      'Broken streetlight increases accident risk after dark.',
-      'Waterlogging can cause slipping and infrastructure damage.',
-      'Road hazard requires immediate municipal inspection.',
-    ];
+    final confidenceRaw = parsedResult['confidence'];
+    double confidence = 0.88;
+    if (confidenceRaw is int) {
+      confidence = confidenceRaw / 100.0;
+    } else if (confidenceRaw is double) {
+      confidence =
+          confidenceRaw > 1.0 ? confidenceRaw / 100.0 : confidenceRaw;
+    }
 
-    final idx = rng.nextInt(categories.length);
-    final detectedCategory = categories[idx];
-    final severity = severities[idx];
-    final description = descriptions[idx];
-    final hazardReason = hazardReasons[idx];
-    const confidence = 0.87; // realistic confidence for heuristic
+    final String description = parsedResult['description'] as String? ??
+        'Civic hazard detected in uploaded image.';
+    final String hazardReason = parsedResult['hazard_reason'] as String? ??
+        'This hazard requires municipal attention.';
 
     final duplicate = _findDuplicate(
       latitude,
@@ -452,32 +242,120 @@ class GeminiTriageService {
     };
   }
 
-  /// Builds a standardised error result map.
-  static Map<String, dynamic> _errorResult({
+  // --- Public Repair Verification API --------------------------------------
+  static Future<Map<String, dynamic>> verifyRepair({
+    required String beforeImageBase64,
+    required String afterImageBase64,
+    required String category,
+  }) async {
+    final apiKey = _effectiveApiKey.trim();
+    final cleanBefore = _cleanBase64(beforeImageBase64);
+    final cleanAfter = _cleanBase64(afterImageBase64);
+
+    final payload = {
+      'contents': [
+        {
+          'parts': [
+            {
+              'text':
+                  'Compare these two images of a civic repair job for "$category".\n'
+                  'Image 1 (BEFORE): Shows the original hazard.\n'
+                  'Image 2 (AFTER): Shows the repair attempt.\n\n'
+                  'Has the repair been successfully completed? '
+                  'Return ONLY a raw JSON object: '
+                  '{"verified": true or false, "confidence": integer 0-100, "summary": "one sentence verdict", "details": "what you observed in both images"}',
+            },
+            {
+              'inlineData': {'mimeType': 'image/jpeg', 'data': cleanBefore},
+            },
+            {
+              'inlineData': {'mimeType': 'image/jpeg', 'data': cleanAfter},
+            },
+          ],
+        },
+      ],
+      'generationConfig': {
+        'responseMimeType': 'application/json',
+      },
+    };
+
+    for (final model in _models) {
+      final endpoint =
+          'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey';
+
+      try {
+        final response = await _dio.post(
+          endpoint,
+          data: payload,
+          options: Options(
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': apiKey,
+            },
+          ),
+        );
+
+        final dynamic resData = response.data is String
+            ? jsonDecode(response.data)
+            : response.data;
+
+        final rawText = resData?['candidates']?[0]?['content']?['parts']?[0]
+                ?['text'] as String? ??
+            '';
+
+        final parsed = _parseGeminiJson(rawText);
+        if (parsed.isNotEmpty) {
+          final confidenceRaw = parsed['confidence'];
+          double confidenceDouble = 0.85;
+          if (confidenceRaw is int) {
+            confidenceDouble = confidenceRaw / 100.0;
+          } else if (confidenceRaw is double) {
+            confidenceDouble = confidenceRaw > 1.0
+                ? confidenceRaw / 100.0
+                : confidenceRaw;
+          }
+
+          return {
+            'verified': parsed['verified'] ?? false,
+            'confidence': confidenceDouble,
+            'summary': parsed['summary'] ?? 'Verification complete.',
+            'details': parsed['details'] ?? 'Assessed via Gemini Vision audit.',
+          };
+        }
+      } catch (_) {}
+    }
+
+    return {
+      'verified': false,
+      'confidence': 0.0,
+      'summary': 'Verification failed',
+      'details': 'Could not complete AI verification.',
+    };
+  }
+
+  // --- Private Utilities ---------------------------------------------------
+  static Map<String, dynamic> _buildErrorResult({
     required double latitude,
     required double longitude,
     required String error,
-    bool apiKeyMissing = false,
   }) {
     return {
-      'category': apiKeyMissing ? 'Unknown' : 'Road Hazard',
+      'category': 'Road Hazard',
       'severity': 'Medium',
       'reason': error,
       'description': error,
-      'hazard_reason': apiKeyMissing
-          ? 'Please provide a valid Gemini API key.'
-          : 'Could not complete AI analysis.',
+      'hazard_reason': 'Could not complete AI vision triage.',
       'confidence': 0.0,
       'latitude': latitude,
       'longitude': longitude,
       'isDuplicate': false,
+      'duplicateTicketId': null,
       'upvotesAwarded': 0,
-      'apiKeyMissing': apiKeyMissing,
+      'apiKeyMissing': !isApiKeyConfigured,
       'error': error,
     };
   }
 
-  /// Normalizes severity string to one of the four expected values.
   static String _normalizeSeverity(String raw) {
     switch (raw.toLowerCase()) {
       case 'critical':
@@ -494,8 +372,6 @@ class GeminiTriageService {
     }
   }
 
-  /// Infers a valid category from free-form text when the API returns an
-  /// unrecognised category string.
   static String _inferCategoryFromText(String text) {
     final lower = text.toLowerCase();
     if (lower.contains('pothole') ||
@@ -534,7 +410,6 @@ class GeminiTriageService {
     return 'Road Hazard';
   }
 
-  /// Finds a duplicate ticket within 30 m radius with the same category.
   static Map<String, dynamic>? _findDuplicate(
     double lat,
     double lng,
